@@ -23,7 +23,7 @@ tf = 'trippub.csv'
 df = pd.read_csv(tf)
 print(f"STEP 2: CSV loaded, shape={df.shape}")
 
-# 2. Remove rows with missing target and encode VEHTYPE
+# 2. Remove rows with missing VEHTYPE and encode target
 print("STEP 3: Dropping NA on VEHTYPE")
 df = df.dropna(subset=['VEHTYPE'])
 print(f"STEP 3: After dropna, shape={df.shape}")
@@ -43,11 +43,13 @@ le_seq.fit(seq_raw.flatten())
 X_seq = le_seq.transform(seq_raw.flatten()).reshape(-1, max_segments)
 print("STEP 4: Sequence encoding done")
 
-# 4. Select and scale ONLY the Top-9 numeric features
+# 4. Select and scale an expanded set of 18 numeric features
 print("STEP 5: Scaling numeric features")
 num_cols = [
     'VMT_MILE','TRPMILES','HHSIZE','TRVLCMIN','HHVEHCNT',
-    'NUMTRANS','GASPRICE','TDTRPNUM','TRWAITTM'
+    'NUMTRANS','GASPRICE','TDTRPNUM','TRWAITTM',
+    'TRPMILAD','DWELTIME','TDWKND','PUBTRANS','PSGR_FLG',
+    'NUMONTRP','TRPTRANS','TRPHHVEH','TRPHHACC'
 ]
 X_num = df[num_cols].fillna(0).values.astype(float)
 scaler = StandardScaler()
@@ -55,20 +57,20 @@ X_num = scaler.fit_transform(X_num)
 y = df['target'].values
 print("STEP 5: Numeric scaling done")
 
-# 5. Split into training and test sets
+# 5. Split into train/test
 print("STEP 6: Performing train_test_split")
 X_seq_train, X_seq_test, X_num_train, X_num_test, y_train, y_test = train_test_split(
     X_seq, X_num, y, test_size=0.2, stratify=y, random_state=42
 )
 print("STEP 6: Split done")
 
-# 6. Compute class weights to address imbalance
+# 6. Compute class weights for imbalance
 class_counts = np.bincount(y_train)
 class_weights = 1.0 / (class_counts + 1e-6)
 class_weights = class_weights / class_weights.sum() * num_classes
 weight_tensor = torch.tensor(class_weights, dtype=torch.float32)
 
-# 7. Create PyTorch Dataset and DataLoader
+# 7. Build DataLoaders
 print("STEP 7: Building DataLoaders")
 class TripChainDataset(Dataset):
     def __init__(self, seq, num, labels):
@@ -90,31 +92,32 @@ test_loader = DataLoader(
 )
 print("STEP 7: DataLoaders ready")
 
-# 8. Define a higher-capacity Transformer + deeper numeric MLP
-print("STEP 8a: Instantiating UpdatedTransformerClassifier")
-class UpdatedTransformerClassifier(nn.Module):
+# 8. Define a richer Transformer + deeper numeric MLP
+print("STEP 8a: Instantiating RichTransformerClassifier")
+class RichTransformerClassifier(nn.Module):
     def __init__(self,
                  num_codes,
-                 embed_dim=32,
+                 embed_dim=48,
                  seq_len=10,
-                 num_numeric=9,
+                 num_numeric=18,
                  n_heads=4,
-                 ff_dim=256,
+                 ff_dim=512,
                  n_layers=4,
                  n_classes=11):
         super().__init__()
         # sequence branch
         self.embedding     = nn.Embedding(num_codes, embed_dim)
         self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, embed_dim))
-        encoder_layer      = nn.TransformerEncoderLayer(
+        enc_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=n_heads,
             dim_feedforward=ff_dim,
             batch_first=True,
             dropout=0.1
         )
-        self.transformer   = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        # numeric branch: deep MLP
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+
+        # numeric branch
         self.num_mlp = nn.Sequential(
             nn.Linear(num_numeric, ff_dim),
             nn.ReLU(),
@@ -123,7 +126,8 @@ class UpdatedTransformerClassifier(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.2)
         )
-        # fusion + classifier head
+
+        # fusion & classifier
         self.norm = nn.LayerNorm(embed_dim * 2)
         self.classifier = nn.Sequential(
             nn.Linear(embed_dim * 2, ff_dim),
@@ -138,36 +142,37 @@ class UpdatedTransformerClassifier(nn.Module):
         x = self.transformer(x).mean(dim=1)             # (B, D)
         # numeric path
         n = self.num_mlp(num)                           # (B, D)
-        # fuse, normalize, classify
-        combined = self.norm(torch.cat([x, n], dim=1))  # (B, 2D)
+        # fuse + predict
+        combined = torch.cat([x, n], dim=1)             # (B, 2D)
+        combined = self.norm(combined)
         return self.classifier(combined)                # (B, C)
 
 print("STEP 8b: Moving model to device")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = UpdatedTransformerClassifier(
+model = RichTransformerClassifier(
     num_codes=len(le_seq.classes_),
-    embed_dim=32,
+    embed_dim=48,
     seq_len=max_segments,
     num_numeric=len(num_cols),
     n_heads=4,
-    ff_dim=256,
+    ff_dim=512,
     n_layers=4,
     n_classes=num_classes
 ).to(device)
 print(f"STEP 8c: Model is on {device}")
 
-# 8.1 Create weighted loss function
-print("STEP 8d: About to create loss with class weights")
+# 8.1 Weighted loss
+print("STEP 8d: About to create weighted loss")
 criterion = nn.CrossEntropyLoss(weight=weight_tensor.to(device))
 print("STEP 8e: Criterion created")
 
-# 8.2 Create optimizer (AdamW) and scheduler
+# 8.2 Optimizer & scheduler
 print("STEP 8f: About to create optimizer (AdamW)")
-optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
-scheduler = CosineAnnealingLR(optimizer, T_max=10)
+optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-2)
+scheduler = CosineAnnealingLR(optimizer, T_max=30)
 print("STEP 8g: Optimizer and scheduler created")
 
-# 9. Define training and evaluation procedures
+# 9. Training & evaluation
 def train_epoch(loader):
     model.train()
     total_loss = 0
@@ -196,16 +201,16 @@ def evaluate(loader):
     mode_names = [str(c) for c in le_target.classes_]
     print(classification_report(targets, preds, target_names=mode_names, zero_division=0))
 
-# 10. Train the updated Transformer model
+# 10. Train updated Transformer
 print("STEP 9: Entering training loop")
-for epoch in range(1, 21):
+for epoch in range(1, 31):
     loss = train_epoch(train_loader)
     print(f"Epoch {epoch}: loss={loss:.4f}")
 
 print("=== Updated Transformer Evaluation ===")
 evaluate(test_loader)
 
-# 11. Train and evaluate the XGBoost baseline
+# 11. Train & evaluate XGBoost baseline
 print("STEP 10: Running XGBoost baseline")
 xgb_clf = xgb.XGBClassifier(
     n_estimators=100,
@@ -225,8 +230,8 @@ print(classification_report(
     zero_division=0
 ))
 
-# 12. Permutation Importance on numeric features
-print("STEP 11: Computing permutation importance for XGBoost")
+# 12. Permutation Importance for XGBoost
+print("STEP 11: Computing permutation importance")
 perm_result = permutation_importance(
     xgb_clf, X_num_test, y_test,
     n_repeats=10, random_state=42, scoring="accuracy"
